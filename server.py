@@ -13,6 +13,8 @@ import json
 import os
 import platform
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -28,8 +30,42 @@ SERVER_PORT = int(os.environ.get("PORT", 9500))
 VIEWPORT_W = int(os.environ.get("VIEWPORT_W", 1366))
 VIEWPORT_H = int(os.environ.get("VIEWPORT_H", 768))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", 70))
+# Serve over HTTPS so clients on a LAN IP get a "secure context" (required for
+# clipboard copy/paste) and the link is encrypted. Enable with TLS=1.
+USE_TLS = os.environ.get("TLS", "0") == "1"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+CERT_FILE = os.path.join(HERE, "cert.pem")
+KEY_FILE = os.path.join(HERE, "key.pem")
+
+
+def local_ip():
+    """Best-effort primary LAN IP of this machine."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def ensure_cert():
+    """Generate a self-signed cert (valid for this machine's IP + localhost) if
+    one isn't already present. Self-signed means the browser shows a one-time
+    warning, but once accepted the page is a secure context."""
+    if os.path.isfile(CERT_FILE) and os.path.isfile(KEY_FILE):
+        return
+    ip = local_ip()
+    san = f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+         "-keyout", KEY_FILE, "-out", CERT_FILE, "-days", "3650",
+         "-nodes", "-subj", "/CN=remote", "-addext", san],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    log(f"Generated self-signed cert for IP:{ip}")
 
 
 def log(msg):
@@ -565,8 +601,17 @@ def main():
     app.on_cleanup.append(on_cleanup)
     app.router.add_get("/", index_handler)
     app.router.add_get("/ws", ws_handler)
-    log(f"Starting on http://0.0.0.0:{SERVER_PORT}")
-    web.run_app(app, host="0.0.0.0", port=SERVER_PORT, print=None)
+
+    ssl_ctx = None
+    scheme = "http"
+    if USE_TLS:
+        ensure_cert()
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(CERT_FILE, KEY_FILE)
+        scheme = "https"
+
+    log(f"Starting on {scheme}://0.0.0.0:{SERVER_PORT}")
+    web.run_app(app, host="0.0.0.0", port=SERVER_PORT, ssl_context=ssl_ctx, print=None)
 
 
 if __name__ == "__main__":

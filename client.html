@@ -60,7 +60,7 @@ let ws, frames = 0, fpsT = Date.now(), gotFrame = false;
 
 /* ── WebSocket ── */
 function connect() {
-  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.onopen  = () => { stEl.textContent = 'Connected'; sendResize(); };
   ws.onclose = () => { stEl.textContent = 'Disconnected — reconnecting…'; setTimeout(connect, 2000); };
   ws.onerror = () => { stEl.textContent = 'Connection error'; };

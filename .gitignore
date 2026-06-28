@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# TLS cert (self-signed, machine-specific — never commit the key)
+cert.pem
+key.pem
