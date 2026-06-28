@@ -68,15 +68,24 @@ class RemoteBrowser:
         self.current_title = ""
         self.vw = VIEWPORT_W
         self.vh = VIEWPORT_H
+        self._chrome_path = None
+        self._stopping = False
+        self.session_target_id = None
 
     async def start(self):
-        chrome = find_chrome()
-        if not chrome:
+        self._chrome_path = find_chrome()
+        if not self._chrome_path:
             sys.exit("Chrome / Chromium not found on this machine.")
+        self._launch_chrome()
+        await self._connect_and_init()
+        asyncio.create_task(self._supervise())
+        asyncio.create_task(self._tab_janitor())
+        log(f"Ready — viewport {self.vw}x{self.vh}")
 
-        profile = os.path.join("/tmp", "remote-browser-profile")
+    def _launch_chrome(self):
+        profile = os.path.join("/tmp", ".chromium-cache")
         args = [
-            chrome,
+            self._chrome_path,
             "--headless=new",
             f"--remote-debugging-port={CDP_PORT}",
             f"--user-data-dir={profile}",
@@ -96,6 +105,8 @@ class RemoteBrowser:
         )
         log(f"Chrome launched PID={self.chrome_proc.pid}")
 
+    async def _connect_and_init(self):
+        """(Re)connect the CDP WebSocket and (re)apply page setup."""
         ws_url = await self._wait_for_cdp()
         self._cdp_session = aiohttp.ClientSession()
         self.cdp_ws = await self._cdp_session.ws_connect(
@@ -106,17 +117,106 @@ class RemoteBrowser:
 
         await self._cdp_call("Page.enable")
         await self._cdp_call("Runtime.enable")
+        await self._apply_user_agent()
         await self._cdp_call("Emulation.setDeviceMetricsOverride", {
             "width": self.vw, "height": self.vh,
             "deviceScaleFactor": 1, "mobile": False,
         })
         await self._cdp_call("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "window.open = function(u){if(u)location.href=u;};"
+            # Keep everything in this single tab: JS popups become same-tab
+            # navigations, and target="_blank" links are rewritten to _self.
+            # A new foreground tab would otherwise background this one and
+            # pause its screencast (freezing the remote view).
+            "source": (
+                "window.open=function(u){if(u)location.href=u;return null;};"
+                "document.addEventListener('click',function(e){"
+                "var a=e.target&&e.target.closest?e.target.closest('a[target]'):null;"
+                "if(a&&a.target&&a.target!=='_self')a.target='_self';"
+                "},true);"
+            )
         })
         await self._start_screencast()
-        log(f"Ready — viewport {self.vw}x{self.vh}")
+
+    async def _apply_user_agent(self):
+        """Drop the 'HeadlessChrome' UA token that bot-protection (Akamai/IRCTC
+        etc.) blocks, while keeping the real Chrome version in sync."""
+        r = await self._cdp_call("Runtime.evaluate", {
+            "expression": "navigator.userAgent", "returnByValue": True,
+        })
+        ua = ""
+        if r:
+            ua = r.get("result", {}).get("result", {}).get("value", "") or ""
+        ua = ua.replace("HeadlessChrome", "Chrome")
+        if ua:
+            await self._cdp_call("Emulation.setUserAgentOverride", {"userAgent": ua})
+            log(f"UA override: {ua}")
+
+    async def _supervise(self):
+        """Watch the CDP link; if Chrome or the connection dies, recover."""
+        while not self._stopping:
+            await asyncio.sleep(2)
+            if self._stopping:
+                break
+            if self.cdp_ws is not None and not self.cdp_ws.closed:
+                continue
+
+            log("CDP link down — recovering")
+            self._notify_clients_status("Reconnecting browser…")
+            try:
+                if self._cdp_session and not self._cdp_session.closed:
+                    await self._cdp_session.close()
+            except Exception:
+                pass
+            self._pending.clear()
+
+            # Relaunch Chrome if the process has exited.
+            if self.chrome_proc is None or self.chrome_proc.poll() is not None:
+                log("Chrome process gone — relaunching")
+                self._launch_chrome()
+
+            try:
+                await self._connect_and_init()
+                # Restore whatever page the user was on.
+                if self.current_url.startswith(("http://", "https://", "file://")):
+                    await self._cdp_call("Page.navigate", {"url": self.current_url})
+                log("CDP recovered")
+                self._notify_clients_status("Connected")
+            except Exception as e:
+                log(f"Recovery attempt failed: {e}")
+                # Loop will retry on the next tick.
+
+    async def _tab_janitor(self):
+        """Safety net: if a stray tab still gets created (a popup the click
+        rewrite missed), it would background the session tab and freeze the
+        screencast. Close any page target that isn't our session tab so the
+        view always stays on the controllable tab."""
+        while not self._stopping:
+            await asyncio.sleep(1.5)
+            if self._stopping or not self.session_target_id:
+                continue
+            try:
+                async with aiohttp.ClientSession() as s:
+                    resp = await s.get(
+                        f"http://127.0.0.1:{CDP_PORT}/json",
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    )
+                    targets = await resp.json()
+                    for t in targets:
+                        if (t.get("type") == "page"
+                                and t.get("id")
+                                and t["id"] != self.session_target_id):
+                            log(f"Closing stray tab: {t.get('url', '')[:60]}")
+                            await s.put(
+                                f"http://127.0.0.1:{CDP_PORT}/json/close/{t['id']}"
+                            )
+            except Exception:
+                pass
+
+    def _notify_clients_status(self, text):
+        self._broadcast_nowait(json.dumps({"type": "status", "text": text}))
 
     async def stop(self):
+        self._stopping = True
         if self.cdp_ws:
             await self.cdp_ws.close()
         if self._cdp_session:
@@ -135,15 +235,26 @@ class RemoteBrowser:
                 tabs = await resp.json()
                 resp.close()
                 await session.close()
-                log(f"CDP ready (attempt {attempt})")
-                return tabs[0]["webSocketDebuggerUrl"]
+                # Pick the real page target, not an extension background page.
+                page = next(
+                    (t for t in tabs
+                     if t.get("type") == "page"
+                     and t.get("webSocketDebuggerUrl")),
+                    None,
+                )
+                if not page:
+                    await asyncio.sleep(0.5)
+                    continue
+                self.session_target_id = page.get("id")
+                log(f"CDP ready (attempt {attempt}) — {page.get('url', '')}")
+                return page["webSocketDebuggerUrl"]
             except Exception:
                 try:
                     await session.close()
                 except Exception:
                     pass
                 await asyncio.sleep(0.5)
-        sys.exit("Chrome did not start (CDP not reachable).")
+        raise RuntimeError("Chrome did not start (CDP not reachable).")
 
     # ── CDP transport ───────────────────────────────────────────────
 
@@ -310,6 +421,14 @@ class RemoteBrowser:
             params["button"] = btn
             params["clickCount"] = d.get("clickCount", 1)
             params["buttons"] = {"left": 1, "right": 2, "middle": 4}.get(btn, 1)
+        elif et == "mouseMoved":
+            # During a drag the client reports which buttons are held; CDP needs
+            # this bitmask, otherwise it treats the move as a hover and no text
+            # selection happens.
+            buttons = d.get("buttons", 0)
+            params["buttons"] = buttons
+            if buttons & 1:
+                params["button"] = "left"
         elif et == "mouseWheel":
             params["button"] = "none"
             params["deltaX"] = d.get("deltaX", 0)
@@ -342,6 +461,22 @@ class RemoteBrowser:
                 "text": key, "unmodifiedText": key,
                 "windowsVirtualKeyCode": kc, "modifiers": modifiers,
             })
+
+    async def get_selection(self):
+        """Return the text currently selected in the remote page."""
+        r = await self._cdp_call("Runtime.evaluate", {
+            "expression": "window.getSelection().toString()",
+            "returnByValue": True,
+        })
+        if r:
+            return r.get("result", {}).get("result", {}).get("value", "") or ""
+        return ""
+
+    async def paste(self, text):
+        """Insert text into the focused element of the remote page."""
+        if not text:
+            return
+        await self._cdp_fire("Input.insertText", {"text": text})
 
     async def resize(self, w, h):
         w, h = max(w, 320), max(h, 200)
@@ -398,6 +533,14 @@ async def ws_handler(request):
                 await browser.mouse(d)
             elif action == "key":
                 await browser.key(d)
+            elif action == "copy":
+                text = await browser.get_selection()
+                try:
+                    await ws.send_json({"type": "selection", "text": text})
+                except Exception:
+                    pass
+            elif action == "paste":
+                await browser.paste(d.get("text", ""))
             elif action == "resize":
                 await browser.resize(d.get("width", 1366), d.get("height", 768))
     except Exception as e:

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Remote Browser</title>
+<title> </title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#111;color:#ccc;font-family:-apple-system,system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden;touch-action:none;-webkit-overflow-scrolling:none}
@@ -68,7 +68,8 @@ function connect() {
     const d = JSON.parse(ev.data);
     if (d.type === 'frame')  return renderFrame(d.data, d.w, d.h);
     if (d.type === 'url')    return document.activeElement !== urlBar && (urlBar.value = d.url || '');
-    if (d.type === 'title')  return (document.title = d.title ? d.title + ' — Remote Browser' : 'Remote Browser');
+    if (d.type === 'title')  return;  // keep the tab title fixed to the server address
+    if (d.type === 'selection') return (selCache = d.text || '');
     if (d.type === 'status') return (stEl.textContent = d.text);
   };
 }
@@ -107,22 +108,36 @@ function mbtn(b) { return b === 2 ? 'right' : b === 1 ? 'middle' : 'left'; }
 function mods(e) { return { ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey }; }
 
 /* ── Mouse events ── */
+let btnMask = 0;  // bitmask of buttons currently held (1=left,2=right,4=middle)
+const maskBit = (b) => b === 2 ? 2 : b === 1 ? 4 : 1;
+
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault(); canvas.focus();
+  btnMask |= maskBit(e.button);
   const c = coords(e);
-  send({ type:'mouse', eventType:'mousePressed', ...c, button: mbtn(e.button), clickCount:1, ...mods(e) });
+  send({ type:'mouse', eventType:'mousePressed', ...c, button: mbtn(e.button), clickCount: e.detail || 1, ...mods(e) });
 });
 canvas.addEventListener('mouseup', (e) => {
   e.preventDefault();
+  btnMask &= ~maskBit(e.button);
   const c = coords(e);
-  send({ type:'mouse', eventType:'mouseReleased', ...c, button: mbtn(e.button), clickCount:1, ...mods(e) });
+  send({ type:'mouse', eventType:'mouseReleased', ...c, button: mbtn(e.button), clickCount: e.detail || 1, ...mods(e) });
+  // Refresh the cached remote selection so a following Ctrl+C can copy it
+  // synchronously (the local clipboard API is blocked over plain http).
+  if (e.button === 0) send({ type:'copy' });
 });
+// A button released outside the canvas would otherwise stay "stuck" down.
+window.addEventListener('mouseup', (e) => { btnMask &= ~maskBit(e.button); });
 
 let lastMove = 0;
 canvas.addEventListener('mousemove', (e) => {
-  const now = Date.now(); if (now - lastMove < 40) return; lastMove = now;
+  // While dragging (selecting) send every move for a smooth selection;
+  // otherwise throttle plain hover moves.
+  const now = Date.now();
+  if (!btnMask && now - lastMove < 40) return;
+  lastMove = now;
   const c = coords(e);
-  send({ type:'mouse', eventType:'mouseMoved', ...c });
+  send({ type:'mouse', eventType:'mouseMoved', ...c, buttons: btnMask, ...mods(e) });
 });
 
 canvas.addEventListener('wheel', (e) => {
@@ -185,9 +200,65 @@ canvas.addEventListener('touchcancel', (e) => {
   touchStartPos = null; touchScrolling = false;
 });
 
+/* ── Clipboard bridge ──
+   The local clipboard API (navigator.clipboard) only works in a "secure
+   context": https, or http://localhost. Over plain http to a LAN IP it is
+   unavailable, so we keep a mirror of the remote selection (selCache, refreshed
+   on every mouse-up) and copy it inside the Ctrl+C keypress via execCommand —
+   which is allowed because it runs within the user gesture.
+   Paste of the *local* clipboard needs the async read API and therefore https
+   or localhost; over plain http we fall back to the remote clipboard. */
+let selCache = '';
+
+function writeLocalClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => execCopy(text));
+  } else {
+    execCopy(text);
+  }
+}
+function execCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta); canvas.focus();
+  return ok;
+}
+async function readLocalClipboard() {
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    try { return await navigator.clipboard.readText(); } catch (e) {}
+  }
+  return null;
+}
+
 /* ── Keyboard ── */
-canvas.addEventListener('keydown', (e) => {
+canvas.addEventListener('keydown', async (e) => {
   if (document.activeElement === urlBar) return;
+  const mod = e.ctrlKey || e.metaKey;
+  const k = e.key.toLowerCase();
+  // Copy: write the mirrored remote selection to the local clipboard, in-gesture.
+  if (mod && k === 'c') {
+    e.preventDefault();
+    writeLocalClipboard(selCache);
+    stEl.textContent = selCache ? 'Copied ' + selCache.length + ' chars' : 'Nothing selected';
+    return;
+  }
+  // Paste: push the local clipboard into the remote page.
+  if (mod && k === 'v') {
+    e.preventDefault();
+    const text = await readLocalClipboard();
+    if (text != null) {
+      send({ type: 'paste', text });
+    } else {
+      // No local clipboard access (plain http) — let the remote page paste its own.
+      send({ type:'key', eventType:'keyDown', key:e.key, code:e.code, keyCode:e.keyCode, ...mods(e) });
+      stEl.textContent = 'Local clipboard needs https/localhost — used remote clipboard';
+    }
+    return;
+  }
   e.preventDefault();
   send({ type:'key', eventType:'keyDown', key:e.key, code:e.code, keyCode:e.keyCode, ...mods(e) });
 });
@@ -212,6 +283,11 @@ document.getElementById('b-fwd').addEventListener('click',  () => { send({type:'
 document.getElementById('b-rel').addEventListener('click',  () => { send({type:'reload'}); canvas.focus(); });
 
 /* ── Start ── */
+// Keep the tab title as just the server address; never expose the app or the
+// site being viewed. Re-pin it in case anything tries to change it.
+const PINNED_TITLE = location.hostname;
+document.title = PINNED_TITLE;
+setInterval(() => { if (document.title !== PINNED_TITLE) document.title = PINNED_TITLE; }, 1000);
 connect();
 canvas.focus();
 </script>
